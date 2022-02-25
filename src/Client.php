@@ -406,7 +406,7 @@ class Client
             return;
         }
 
-        $response = $this->client->request('GET', self::B2_API_BASE_URL.self::B2_API_V1.'/b2_authorize_account', [
+        $response = $this->client->request('GET', self::B2_API_BASE_URL.self::B2_API_V1.'b2_authorize_account', [
             'auth' => [$this->accountId, $this->applicationKey],
         ]);
 
