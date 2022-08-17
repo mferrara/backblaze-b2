@@ -2,6 +2,7 @@
 
 namespace BackblazeB2;
 
+use BackblazeB2\Exceptions\B2Exception;
 use BackblazeB2\Exceptions\NotFoundException;
 use BackblazeB2\Exceptions\ValidationException;
 use BackblazeB2\Http\Client as HttpClient;
@@ -395,6 +396,38 @@ class Client
         ]);
 
         return true;
+    }
+
+    /**
+     * Fetches authorization and uri for a file, to allow a third-party system to download public and private files.
+     *
+     * @param array $options
+     *
+     * @throws GuzzleException
+     * @throws NotFoundException
+     * @throws GuzzleException   If the request fails.
+     * @throws B2Exception       If the B2 server replies with an error.
+     *
+     * @return array
+     */
+    public function getFileUri(array $options)
+    {
+        if (!isset($options['FileId']) && !isset($options['BucketName']) && isset($options['BucketId'])) {
+            $options['BucketName'] = $this->getBucketNameFromId($options['BucketId']);
+        }
+
+        $this->authorizeAccount();
+
+        if (isset($options['FileId'])) {
+            $requestUri = $this->downloadUrl.'/b2api/v1/b2_download_file_by_id?fileId='.urlencode($options['FileId']);
+        } else {
+            $requestUri = sprintf('%s/file/%s/%s', $this->downloadUrl, $options['BucketName'], $options['FileName']);
+        }
+
+        return [
+            'Authorization' => $this->authToken,
+            'Uri'           => $requestUri,
+        ];
     }
 
     /**
