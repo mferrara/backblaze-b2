@@ -633,7 +633,7 @@ class Client
         $this->authorizeAccount();
 
         // 1) b2_start_large_file, (returns fileId)
-        $start = $this->startLargeFile($options['FileName'], $options['FileContentType'], $options['BucketId']);
+        $start = $this->startLargeFile($options['RemoteName'] ?? $options['FileName'], $options['FileContentType'], $options['BucketId']);
 
         // 2) b2_get_upload_part_url for each thread uploading (takes fileId)
         $url = $this->getUploadPartUrl($start['fileId']);
