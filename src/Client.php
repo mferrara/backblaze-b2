@@ -2,9 +2,10 @@
 
 namespace BackblazeB2;
 
-use BackblazeB2\Exceptions\B2Exception;
 use BackblazeB2\Exceptions\NotFoundException;
 use BackblazeB2\Exceptions\ValidationException;
+use Psr\Cache\CacheItemPoolInterface;
+use BackblazeB2\Exceptions\B2Exception;
 use BackblazeB2\Http\Client as HttpClient;
 use Carbon\Carbon;
 use GuzzleHttp\Exception\GuzzleException;
@@ -13,6 +14,8 @@ class Client
 {
     const B2_API_BASE_URL = 'https://api.backblazeb2.com';
     const B2_API_V1 = '/b2api/v1/';
+    const AUTH_CACHE_PREFIX = 'b2_auth_';
+
     protected $accountId;
     protected $applicationKey;
     protected $authToken;
@@ -21,33 +24,121 @@ class Client
     protected $client;
     protected $reAuthTime;
     protected $authTimeoutSeconds;
+    protected static $sharedAuthData = [];
+    protected ?CacheItemPoolInterface $cache;
 
     /**
      * Accepts the account ID, application key and an optional array of options.
      *
-     * @param $accountId
-     * @param $applicationKey
-     * @param array $options
-     *
-     * @throws \Exception
+     * @param string $accountId
+     * @param string $applicationKey
+     * @param array $options {
+     *      @var int $auth_timeout_seconds
+     *      @var HttpClient $client
+     *      @var CacheItemPoolInterface $cache PSR-6 cache implementation
+     * }
      */
     public function __construct($accountId, $applicationKey, array $options = [])
     {
         $this->accountId = $accountId;
         $this->applicationKey = $applicationKey;
+        $this->authTimeoutSeconds = $options['auth_timeout_seconds'] ?? (12 * 60 * 60); // 12 hour default
+        $this->client = $options['client'] ?? new HttpClient(['exceptions' => false]);
+        $this->cache = $options['cache'] ?? null;
 
-        $this->authTimeoutSeconds = 12 * 60 * 60; // 12 hour default
-        if (isset($options['auth_timeout_seconds'])) {
-            $this->authTimeoutSeconds = $options['auth_timeout_seconds'];
-        }
-
-        // set reauthorize time to force an authentication to take place
+        // Initialize reAuthTime to force first auth
         $this->reAuthTime = Carbon::now('UTC')->subSeconds($this->authTimeoutSeconds * 2);
 
-        $this->client = new HttpClient(['exceptions' => false]);
-        if (isset($options['client'])) {
-            $this->client = $options['client'];
+        // Initialize with cached auth data if available
+        $this->loadCachedAuthData();
+    }
+
+    /**
+     * Load cached authorization data from memory and persistent cache if available
+     */
+    protected function loadCachedAuthData(): void
+    {
+        $cacheKey = self::AUTH_CACHE_PREFIX . $this->accountId;
+
+        // Try memory cache first
+        if (isset(self::$sharedAuthData[$cacheKey])) {
+            $authData = self::$sharedAuthData[$cacheKey];
         }
+        // Try persistent cache if available
+        elseif ($this->cache) {
+            $cacheItem = $this->cache->getItem($cacheKey);
+            if ($cacheItem->isHit()) {
+                $authData = $cacheItem->get();
+                // Also store in memory for future use
+                self::$sharedAuthData[$cacheKey] = $authData;
+            }
+        }
+
+        if (!empty($authData)) {
+            $this->authToken = $authData['authorizationToken'] ?? null;
+            $this->apiUrl = $authData['apiUrl'] ?? null;
+            $this->downloadUrl = $authData['downloadUrl'] ?? null;
+            $this->reAuthTime = $authData['reAuthTime'] ?? null;
+
+            // Convert reAuthTime back to Carbon if it's a string
+            if (is_string($this->reAuthTime)) {
+                $this->reAuthTime = new Carbon($this->reAuthTime);
+            }
+        }
+    }
+
+    /**
+     * Save authorization data to memory and persistent cache if available
+     */
+    protected function saveAuthData(): void
+    {
+        if (!$this->authToken) {
+            return;
+        }
+
+        $authData = [
+            'authorizationToken' => $this->authToken,
+            'apiUrl' => $this->apiUrl,
+            'downloadUrl' => $this->downloadUrl,
+            'reAuthTime' => $this->reAuthTime
+        ];
+
+        $cacheKey = self::AUTH_CACHE_PREFIX . $this->accountId;
+
+        // Save to memory cache
+        self::$sharedAuthData[$cacheKey] = $authData;
+
+        // Save to persistent cache if available
+        if ($this->cache) {
+            $cacheItem = $this->cache->getItem($cacheKey);
+            $cacheItem->set($authData);
+            $cacheItem->expiresAfter($this->authTimeoutSeconds);
+            $this->cache->save($cacheItem);
+        }
+    }
+
+    /**
+     * Clear cached authorization data from both memory and persistent cache
+     */
+    protected function clearAuthData(): void
+    {
+        $cacheKey = self::AUTH_CACHE_PREFIX . $this->accountId;
+
+        // Clear from memory
+        unset(self::$sharedAuthData[$cacheKey]);
+
+        // Clear from persistent cache if available
+        if ($this->cache) {
+            $this->cache->deleteItem($cacheKey);
+        }
+    }
+
+    /**
+     * Clear all cached auth data (useful for testing)
+     */
+    public static function clearSharedAuthData(): void
+    {
+        self::$sharedAuthData = [];
     }
 
     /**
@@ -149,6 +240,8 @@ class Client
             $options['BucketId'] = $this->getBucketIdFromName($options['BucketName']);
         }
 
+        $this->authorizeAccount();
+
         $this->sendAuthorizedRequest('POST', 'b2_delete_bucket', [
             'accountId' => $this->accountId,
             'bucketId'  => $options['BucketId'],
@@ -178,8 +271,9 @@ class Client
             $options['BucketId'] = $this->getBucketIdFromName($options['BucketName']);
         }
 
-        // Retrieve the URL that we should be uploading to.
+        $this->authorizeAccount();
 
+        // Retrieve the URL that we should be uploading to.
         $response = $this->sendAuthorizedRequest('POST', 'b2_get_upload_url', [
             'bucketId' => $options['BucketId'],
         ]);
@@ -247,11 +341,11 @@ class Client
      */
     public function download(array $options)
     {
+        $this->authorizeAccount();
+
         if (!isset($options['FileId']) && !isset($options['BucketName']) && isset($options['BucketId'])) {
             $options['BucketName'] = $this->getBucketNameFromId($options['BucketId']);
         }
-
-        $this->authorizeAccount();
 
         $requestUrl = null;
         $customHeaders = $options['Headers'] ?? [];
@@ -345,18 +439,16 @@ class Client
      * @throws B2Exception     If the B2 server replies with an error.
      *
      * @return array
-     */
+    */
     public function listFiles(array $options)
     {
-        // if FileName is set, we only attempt to retrieve information about that single file.
-        $fileName = !empty($options['FileName']) ? $options['FileName'] : null;
+        $this->authorizeAccount();
 
+        $fileName = !empty($options['FileName']) ? $options['FileName'] : null;
         $nextFileName = null;
         $maxFileCount = 1000;
-
         $prefix = isset($options['Prefix']) ? $options['Prefix'] : '';
         $delimiter = isset($options['Delimiter']) ? $options['Delimiter'] : null;
-
         $files = [];
 
         if (!isset($options['BucketId']) && isset($options['BucketName'])) {
@@ -368,9 +460,6 @@ class Client
             $maxFileCount = 1;
         }
 
-        $this->authorizeAccount();
-
-        // B2 returns, at most, 1000 files per "page". Loop through the pages and compile an array of File objects.
         while (true) {
             $response = $this->sendAuthorizedRequest('POST', 'b2_list_file_names', [
                 'bucketId'      => $options['BucketId'],
@@ -381,14 +470,22 @@ class Client
             ]);
 
             foreach ($response['files'] as $file) {
-                // if we have a file name set, only retrieve information if the file name matches
                 if (!$fileName || ($fileName === $file['fileName'])) {
-                    $files[] = new File($file['fileId'], $file['fileName'], $file['contentSha1'], $file['size'], $file['contentType'], $file['fileInfo'], $file['bucketId'], $file['action'], $file['uploadTimestamp']);
+                    $files[] = new File(
+                        $file['fileId'],
+                        $file['fileName'],
+                        $file['contentSha1'],
+                        $file['size'],
+                        $file['contentType'],
+                        $file['fileInfo'],
+                        $file['bucketId'],
+                        $file['action'],
+                        $file['uploadTimestamp']
+                    );
                 }
             }
 
             if ($fileName || $response['nextFileName'] === null) {
-                // We've got all the files - break out of loop.
                 break;
             }
 
@@ -476,15 +573,17 @@ class Client
      */
     public function deleteFile(array $options)
     {
+        $this->authorizeAccount();
+
+        // If we only have FileName, get the full file info
         if (!isset($options['FileName'])) {
             $file = $this->getFile($options);
-
             $options['FileName'] = $file->getName();
         }
 
+        // If we don't have FileId but have BucketName/FileName, get the FileId
         if (!isset($options['FileId']) && isset($options['BucketName']) && isset($options['FileName'])) {
             $file = $this->getFile($options);
-
             $options['FileId'] = $file->getId();
         }
 
@@ -510,11 +609,11 @@ class Client
      */
     public function getFileUri(array $options)
     {
+        $this->authorizeAccount();
+
         if (!isset($options['FileId']) && !isset($options['BucketName']) && isset($options['BucketId'])) {
             $options['BucketName'] = $this->getBucketNameFromId($options['BucketId']);
         }
-
-        $this->authorizeAccount();
 
         if (isset($options['FileId'])) {
             $requestUri = $this->downloadUrl.'/b2api/v1/b2_download_file_by_id?fileId='.urlencode($options['FileId']);
@@ -530,12 +629,19 @@ class Client
 
     /**
      * Authorize the B2 account in order to get an auth token and API/download URLs.
+     *
+     * @throws GuzzleException
+     * @throws B2Exception
      */
-    protected function authorizeAccount()
+    protected function authorizeAccount(): void
     {
-        if (Carbon::now('UTC')->timestamp < $this->reAuthTime->timestamp) {
+        // Check if we have valid cached auth data
+        if ($this->authToken && $this->reAuthTime && Carbon::now('UTC')->timestamp < $this->reAuthTime->timestamp) {
             return;
         }
+
+        // Clear existing auth data since we're getting new credentials
+        $this->clearAuthData();
 
         $response = $this->client->guzzleRequest('GET', self::B2_API_BASE_URL.self::B2_API_V1.'b2_authorize_account', [
             'auth' => [$this->accountId, $this->applicationKey],
@@ -544,26 +650,27 @@ class Client
         $this->authToken = $response['authorizationToken'];
         $this->apiUrl = $response['apiUrl'].self::B2_API_V1;
         $this->downloadUrl = $response['downloadUrl'];
-        $this->reAuthTime = Carbon::now('UTC');
-        $this->reAuthTime->addSeconds($this->authTimeoutSeconds);
+        $this->reAuthTime = Carbon::now('UTC')->addSeconds($this->authTimeoutSeconds);
+
+        // Save the new auth data
+        $this->saveAuthData();
     }
 
     /**
-     * Maps the provided bucket name to the appropriate bucket ID.
-     *
-     * @param $name
-     *
-     * @return mixed
+     * Get bucket ID from name with proper authorization
      */
     protected function getBucketIdFromName($name)
     {
-        $buckets = $this->listBuckets();
+        $this->authorizeAccount();
 
+        $buckets = $this->listBuckets();
         foreach ($buckets as $bucket) {
             if ($bucket->getName() === $name) {
                 return $bucket->getId();
             }
         }
+
+        return null;
     }
 
     /**
@@ -575,6 +682,8 @@ class Client
      */
     protected function getBucketNameFromId($id)
     {
+        $this->authorizeAccount();
+
         $buckets = $this->listBuckets();
 
         foreach ($buckets as $bucket) {

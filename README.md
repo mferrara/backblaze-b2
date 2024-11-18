@@ -23,14 +23,28 @@ $ composer require gliterd/backblaze-b2
 ``` php
 use BackblazeB2\Client;
 use BackblazeB2\Bucket;
+use Symfony\Component\Cache\Adapter\FilesystemAdapter;
 
-$options = ['auth_timeout_seconds' => seconds];
+// Basic usage
+$client = new Client('accountId', 'applicationKey');
 
-$client = new Client('accountId', 'applicationKey', $options);
+// With options
+$client = new Client('accountId', 'applicationKey', [
+    'auth_timeout_seconds' => 3600,  // Default is 12 hours
+    'cache' => new FilesystemAdapter(), // Optional PSR-6 cache implementation
+]);
 ```
+
+## The client supports the following options:
+
+_auth_timeout_seconds:_ How long to cache authentication tokens (default: 12 hours)
+
+_cache:_ A PSR-6 compatible cache implementation for persisting auth tokens
+
+_client:_ A custom Guzzle HTTP client instance
+
 _$options_ is optional. If omitted, the default timeout is 12 hours. The timeout allows for a long lived Client object
 so that the authorization token does not expire.
-## *ApplicationKey is not supported yet, please use MasterKey only*
 
 #### Returns a bucket details
 ``` php
@@ -115,6 +129,15 @@ $fileList = $client->listFiles([
 ]);
 ```
 
+## Authentication Caching
+
+The client automatically caches authentication tokens to minimize API requests:
+
+In-memory caching is always enabled
+
+Optional persistent caching via PSR-6 cache implementation
+
+Configurable timeout via `auth_timeout_seconds` option
 
 ## Change log
 

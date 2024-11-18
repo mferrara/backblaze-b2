@@ -20,6 +20,12 @@ class ClientTest extends TestCase
 {
     use TestHelper;
 
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Client::clearSharedAuthData(); // Clear static cache before each test
+    }
+
     public function testCreatePublicBucket()
     {
         $guzzle = $this->buildGuzzleFromResponses([
