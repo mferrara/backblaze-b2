@@ -376,6 +376,7 @@ class Client
      * required FileName the file to copy
      * required SaveAs the path and file name to save to
      * optional DestinationBucketId or DestinationBucketName, the destination bucket
+     * optional FileId the source file id
      *
      * @param array $options
      *
@@ -394,17 +395,22 @@ class Client
             $options['DestinationBucketId'] = $this->getBucketIdFromName($options['DestinationBucketName']);
         }
 
-        if (!isset($options['BucketId']) && isset($options['BucketName'])) {
-            $options['BucketId'] = $this->getBucketIdFromName($options['BucketName']);
-        }
+        // Only lookup the file if we weren't given a FileId
+        if (!isset($options['FileId'])) {
+            if (!isset($options['BucketId']) && isset($options['BucketName'])) {
+                $options['BucketId'] = $this->getBucketIdFromName($options['BucketName']);
+            }
 
-        $sourceFiles = $this->listFiles([
-            'BucketId' => $options['BucketId'],
-            'FileName' => $options['FileName'],
-        ]);
-        $sourceFileId = !empty($sourceFiles) ? $sourceFiles[0]->getId() : false;
-        if (!$sourceFileId) {
-            throw new NotFoundException('Source file not found in B2');
+            $sourceFiles = $this->listFiles([
+                'BucketId' => $options['BucketId'],
+                'FileName' => $options['FileName'],
+            ]);
+            $sourceFileId = !empty($sourceFiles) ? $sourceFiles[0]->getId() : false;
+            if (!$sourceFileId) {
+                throw new NotFoundException('Source file not found in B2');
+            }
+        } else {
+            $sourceFileId = $options['FileId'];
         }
 
         $json = [
